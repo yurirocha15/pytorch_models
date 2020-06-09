@@ -59,7 +59,7 @@ class ParallelDataloader(object):
         self.dataloader = DataLoader(self.dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
 
     def __len__(self):
-        return len(self.dataset)
+        return len(self.dataloader)
 
     def __iter__(self):
         for i, data in enumerate(self.dataloader):

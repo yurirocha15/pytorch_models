@@ -134,3 +134,5 @@ dmypy.json
 #Datasets
 data/
 visualization/
+test_images/
+weights/

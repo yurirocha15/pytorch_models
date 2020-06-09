@@ -1,15 +1,19 @@
+import os
 from pix2pix import networks
 from tqdm import tqdm
-from torch import tensor
-from torch import nn
-from torch import cat
-from torch import no_grad
-from torch import cuda
+from torch import tensor, nn, cat, no_grad, cuda, save, load, unsqueeze, squeeze
 from torch.optim import Adam
-from torchvision.utils import make_grid
-from torchvision.utils import save_image
+from torchvision.utils import make_grid, save_image
+import torchvision.transforms as transforms
+import matplotlib.pyplot as plt
+from PIL import Image
 
 class Pix2Pix(nn.Module):
+    '''
+    Pix2Pix definition
+    Generator: UNet 512
+    Discriminator: Conditional PatchGAN (70x70)
+    '''
     def __init__(self, dataloader, test_dataloader, lr_g=0.0002, lr_d=0.0001, in_channels=3, out_channels=3, batch_size=32, lambdaL1=100.0, isTrain=True):
         super(Pix2Pix, self).__init__()
 
@@ -19,16 +23,20 @@ class Pix2Pix(nn.Module):
         self.batch_size = batch_size
         self.lambdaL1 = lambdaL1
         self.isTrain = isTrain
+
+        #we will resize those buffers later to match the discriminator output size
         self.register_buffer('real_label', tensor(1.0))
         self.register_buffer('fake_label', tensor(0.0))
 
         self.dataloader = dataloader
         self.test_dataloader = test_dataloader
+
+        #Separate a few samples to use as fix evaluators of how the generator is improving during the training
         data = enumerate(self.test_dataloader)
         _, data = next(data)
         batch_size = len(data['A'])
         batch_size = batch_size if batch_size < 8 else 8
-        self.test_images = data['A'][0:batch_size]
+        self.test_images, self.test_labels = data['A'][0:batch_size], data['B'][0:batch_size]
         if cuda.is_available():
             self.test_images = self.test_images.cuda()
 
@@ -58,7 +66,6 @@ class Pix2Pix(nn.Module):
 
         self.losses_G = []
         self.losses_D = []
-        self.img_list = []
 
         count = 0
         for epoch in tqdm(range(epochs), desc='Epochs'):
@@ -84,7 +91,7 @@ class Pix2Pix(nn.Module):
                 fake_imgs = self.forward(input_imgs)
 
                 fake_input = cat((input_imgs, fake_imgs), 1)
-                pred_fake = self.modelD(fake_input.detach())
+                pred_fake = self.modelD(fake_input.detach()) #we use detach to avoid the error backpropagating to the generator
                 target_fake = self.get_target(pred_fake, is_real=False)
                 if cuda.is_available():
                     target_fake = target_fake.cuda()
@@ -98,11 +105,11 @@ class Pix2Pix(nn.Module):
                 ################
                 # Generator
                 ################
-                self.set_requires_grad(self.modelD, False)
+                self.set_requires_grad(self.modelD, False) #we dont need to store intermediate data for the Discriminator, as we wont train it here
                 self.optimizerG.zero_grad()
 
                 fake_input = cat((input_imgs, fake_imgs), 1)
-                pred_fake2 = self.modelD(fake_input)
+                pred_fake2 = self.modelD(fake_input) #we regenerate the prediction with the newly learned weights
                 target_fake = self.get_target(pred_fake2, is_real=True)
                 if cuda.is_available():
                     target_fake = target_fake.cuda()
@@ -126,15 +133,86 @@ class Pix2Pix(nn.Module):
                 if count % 100 == 0 or (epoch == epochs - 1 and i == len(self.dataloader) - 1):
                     with no_grad():
                         fakes = self.modelG(self.test_images).detach().cpu()
-                        grid = make_grid(fakes, padding=2, normalize=True)
-                    self.img_list.append(grid)
-                    save_image(grid, f"./visualization/{count}.png", normalize=False)
+                        grid = make_grid(cat((fakes, self.test_labels, self.test_images.cpu()), 0), padding=2, normalize=True, nrow=8)
+                    save_image(grid, f"./visualization/{count}.jpg", normalize=False)
 
                 count += 1
 
+    def print_losses(self):
+        plt.figure(figsize=(10,5))
+        plt.plot(self.losses_G, label="Generator")
+        plt.plot(self.losses_D, label="Discriminator")
+        plt.xlabel("iterations")
+        plt.ylabel("Loss")
+        plt.legend()
+        plt.show()
 
+    def evaluate(self):
+        losses_G_pred = []
+        losses_G_L1 = []
+        predictions_fake = []
 
+        with no_grad():
+            if cuda.is_available():
+                self.modelG.cuda()
+                self.modelD.cuda()
 
+            for i, data in enumerate(tqdm(self.test_dataloader, desc='Test Batches'), 0):
+                input_imgs, real_imgs = data['A'], data['B']
+                if cuda.is_available():
+                    input_imgs, real_imgs = input_imgs.cuda(), real_imgs.cuda()
+
+                fake_imgs = self.forward(input_imgs)
+                fake_input = cat((input_imgs, fake_imgs), 1)
+                pred_fake = self.modelD(fake_input)
+                target_fake = self.get_target(pred_fake, is_real=True)
+                if cuda.is_available():
+                    target_fake = target_fake.cuda()
+                loss_G_pred = self.criterion(pred_fake, target_fake)
+                loss_G_L1 = self.criterionL1(fake_imgs, real_imgs)
+
+                losses_G_pred.append(loss_G_pred.item())
+                losses_G_L1.append(loss_G_L1.item())
+                predictions_fake.append(pred_fake.mean().item())
+            
+        print(f"Generator L1 error: {sum(losses_G_L1)/len(losses_G_L1):.4f}")
+        print(f"Generator prediction error: {sum(losses_G_pred)/len(losses_G_pred):.4f}")
+        print(f"Discriminator average prediction (the closer to 1 the better): {sum(predictions_fake)/len(predictions_fake):.4f}")
+
+    def generate(self, x):
+        '''
+        Receives an RGB image as input and returns a semantic segmented image
+        '''
+        transform = transforms.Compose([
+            transforms.Resize((512, 512), Image.BICUBIC),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+        ])
+        x = transform(x)
+
+        self.modelG.cpu()
+
+        self.modelG.eval() #avoid batch normalization errors
+
+        transform = transforms.Compose([
+            transforms.Normalize((-1, -1, -1), (2, 2, 2)),
+            transforms.ToPILImage(),
+            transforms.Resize((512, 1024), Image.BICUBIC)
+        ])
+        with no_grad():
+            output = transform(squeeze(self.forward(unsqueeze(x, 0))))
+            
+        return output
+
+    def save_networks(self, path, file_name):
+        save(self.modelD.state_dict(), os.path.join(path, file_name + "D.pth"))
+        save(self.modelG.state_dict(), os.path.join(path, file_name + "G.pth"))
+    
+    def load_networks(self, path, file_name):
+        if os.path.isfile(os.path.join(path, file_name + "D.pth")) and self.isTrain:
+            self.modelD.load_state_dict(load(os.path.join(path, file_name + "D.pth")))
+        if os.path.isfile(os.path.join(path, file_name + "D.pth")):
+            self.modelG.load_state_dict(load(os.path.join(path, file_name + "G.pth")))
 
     def get_target(self, pred_tensor, is_real):
         target = self.real_label if is_real else self.fake_label
